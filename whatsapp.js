@@ -1,12 +1,15 @@
-// PhyllHost WhatsApp OTP service — Baileys connection layer.
+// PhyllHost WhatsApp OTP Service — Baileys Connection Layer.
 //
-// OTP-ONLY by design: this service links one WhatsApp number and sends
-// outbound OTP codes. It NEVER replies to incoming messages — every
-// incoming message is ignored. There is no bot, no menus, no Sheets,
-// no payments. One job: keep the number connected and deliver /send.
+// Features:
+// - One linked WhatsApp number.
+// - Outbound OTP message delivery.
+// - No automatic replies to incoming messages.
+// - Persistent WhatsApp session.
+// - Automatic reconnection.
+// - QR-code linking.
+// - Phyllhost profile-name update.
 //
-// Session persists at /data/whatsapp-session (Coolify persistent volume)
-// so restarts don't need a re-scan.
+// Session persists at /data/whatsapp-session.
 
 import { mkdir, rm } from "node:fs/promises";
 
@@ -19,18 +22,21 @@ import P from "pino";
 import QRCode from "qrcode";
 
 const SESSION_DIR = "/data/whatsapp-session";
+const PROFILE_NAME = "Phyllhost";
 
 let sock = null;
 let currentQR = null;
 let connectionStatus = "disconnected";
 let connectedNumber = null;
+let isStarting = false;
 
-// Bumps on every manual relink/logout so a stale auto-restart timer
-// from an older connection attempt can never spawn a duplicate socket.
+// Prevent an outdated reconnection timer from starting a duplicate socket.
 let connectEpoch = 0;
 
-// Wipe local state + session files so the next start
-// begins clean and WhatsApp issues a fresh QR code.
+/* =========================================
+   CLEAR WHATSAPP SESSION
+========================================= */
+
 async function clearSession() {
   sock = null;
   currentQR = null;
@@ -38,152 +44,324 @@ async function clearSession() {
   connectedNumber = null;
 
   try {
-    await rm(SESSION_DIR, { recursive: true, force: true });
+    await rm(SESSION_DIR, {
+      recursive: true,
+      force: true
+    });
   } catch (error) {
-    console.error("Failed to clear WhatsApp session:", error.message);
+    console.error(
+      "Failed to clear WhatsApp session:",
+      error.message
+    );
   }
 
   try {
-    await mkdir(SESSION_DIR, { recursive: true });
+    await mkdir(SESSION_DIR, {
+      recursive: true
+    });
   } catch (error) {
-    console.error("Failed to recreate session dir:", error.message);
+    console.error(
+      "Failed to recreate session directory:",
+      error.message
+    );
   }
 }
 
+/* =========================================
+   START WHATSAPP CONNECTION
+========================================= */
+
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  if (isStarting) {
+    console.log("WhatsApp startup already in progress.");
+    return;
+  }
 
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: P({ level: "silent" }),
-    browser: ["PhyllHost OTP", "Chrome", "1.0.0"]
-  });
+  isStarting = true;
 
-  sock.ev.on("creds.update", saveCreds);
+  try {
+    await mkdir(SESSION_DIR, {
+      recursive: true
+    });
 
-  // OTP service: incoming messages are deliberately ignored.
-  // No auto-replies, no menus, no forwarding.
+    const { state, saveCreds } =
+      await useMultiFileAuthState(SESSION_DIR);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const socket = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: P({ level: "silent" }),
+      browser: ["PhyllHost OTP", "Chrome", "1.0.0"]
+    });
 
-    if (qr) {
-      connectionStatus = "qr";
-      currentQR = await QRCode.toDataURL(qr);
-      console.log("WhatsApp OTP: QR code generated.");
-    }
+    sock = socket;
 
-    if (connection === "open") {
-      connectionStatus = "connected";
-      currentQR = null;
+    socket.ev.on("creds.update", saveCreds);
 
-      if (sock.user?.id) {
-        connectedNumber = sock.user.id.split(":")[0];
+    // Incoming messages are deliberately ignored.
+    // This service does not implement a chatbot or auto-replies.
+
+    socket.ev.on("connection.update", async (update) => {
+      // Ignore events from a socket that is no longer active.
+      if (sock !== socket) return;
+
+      const {
+        connection,
+        lastDisconnect,
+        qr
+      } = update;
+
+      /* -------------------------
+         QR CODE
+      ------------------------- */
+
+      if (qr) {
+        connectionStatus = "qr";
+        currentQR = await QRCode.toDataURL(qr);
+
+        console.log(
+          "WhatsApp OTP: QR code generated."
+        );
       }
 
-      console.log("WhatsApp OTP: connected.");
-      console.log("Number:", connectedNumber);
-    }
+      /* -------------------------
+         CONNECTED
+      ------------------------- */
 
-    if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      if (connection === "open") {
+        connectionStatus = "connected";
+        currentQR = null;
 
-      // Logged out (from phone or via /disconnect): old creds are
-      // dead, so wipe them and start over to get a fresh QR.
-      if (statusCode === DisconnectReason.loggedOut) {
-        console.log("WhatsApp OTP: logged out. Clearing session for a fresh QR...");
-        await clearSession();
-        scheduleRestart(1000);
-        return;
+        if (socket.user?.id) {
+          connectedNumber =
+            socket.user.id.split(":")[0];
+        }
+
+        console.log("WhatsApp OTP: connected.");
+        console.log("Number:", connectedNumber);
+
+        // Attempt to update the WhatsApp profile name.
+        try {
+          await socket.updateProfileName(PROFILE_NAME);
+
+          console.log(
+            `WhatsApp profile name updated to ${PROFILE_NAME}.`
+          );
+        } catch (error) {
+          console.error(
+            "Could not update WhatsApp profile name:",
+            error.message
+          );
+
+          console.log(
+            "You can also set the profile name in WhatsApp settings."
+          );
+        }
       }
 
-      connectionStatus = "disconnected";
-      currentQR = null;
-      console.log("WhatsApp OTP: disconnected. Reconnecting...");
+      /* -------------------------
+         CONNECTION CLOSED
+      ------------------------- */
 
-      scheduleRestart(3000);
-    }
-  });
+      if (connection === "close") {
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode;
+
+        currentQR = null;
+        connectedNumber = null;
+        connectionStatus = "disconnected";
+
+        console.log(
+          "WhatsApp OTP: connection closed."
+        );
+
+        // Logged out: clear the invalid session and
+        // generate a new QR code.
+        if (
+          statusCode === DisconnectReason.loggedOut
+        ) {
+          console.log(
+            "WhatsApp OTP: logged out. Clearing session."
+          );
+
+          await clearSession();
+          scheduleRestart(1000);
+          return;
+        }
+
+        console.log(
+          "WhatsApp OTP: attempting reconnection."
+        );
+
+        scheduleRestart(3000);
+      }
+    });
+
+  } catch (error) {
+    console.error(
+      "Failed to start WhatsApp:",
+      error.message
+    );
+
+    connectionStatus = "disconnected";
+
+    scheduleRestart(5000);
+
+  } finally {
+    isStarting = false;
+  }
 }
 
-// Restart after `ms`, unless a manual relink/logout happened first.
+/* =========================================
+   AUTOMATIC RECONNECTION
+========================================= */
+
 function scheduleRestart(ms) {
   const epoch = connectEpoch;
+
   setTimeout(() => {
-    if (epoch !== connectEpoch) return; // superseded by relink/logout
+    if (epoch !== connectEpoch) {
+      return;
+    }
+
     startWhatsApp().catch((error) => {
-      console.error("Scheduled WhatsApp OTP restart failed:", error.message);
+      console.error(
+        "Scheduled WhatsApp restart failed:",
+        error.message
+      );
     });
   }, ms);
 }
 
-// Force a brand-new link attempt: tear down the current socket (if any),
-// wipe the session, and start over so WhatsApp issues a fresh QR code.
-// Safe to call in any state — including when a link attempt failed,
-// the QR expired, or the dashboard is stuck on "disconnected".
-async function relink() {
-  connectEpoch++; // invalidate any pending auto-restart
+/* =========================================
+   MANUAL RELINK
+========================================= */
 
-  if (sock) {
+async function relink() {
+  connectEpoch++;
+
+  const oldSocket = sock;
+
+  sock = null;
+  currentQR = null;
+  connectionStatus = "disconnected";
+  connectedNumber = null;
+
+  if (oldSocket) {
     try {
-      // Stop the old socket's close-handler from firing a restart.
-      sock.ev.removeAllListeners();
-      await sock.end(new Error("Manual relink requested"));
+      oldSocket.ev.removeAllListeners();
+
+      await oldSocket.end(
+        new Error("Manual relink requested")
+      );
     } catch (error) {
-      console.error("Relink socket teardown:", error.message);
+      console.error(
+        "Relink socket teardown:",
+        error.message
+      );
     }
   }
 
   await clearSession();
 
   startWhatsApp().catch((error) => {
-    console.error("Failed to restart WhatsApp OTP after relink:", error);
+    console.error(
+      "Failed to restart WhatsApp after relink:",
+      error.message
+    );
   });
 }
+
+/* =========================================
+   GET CONNECTION STATUS
+========================================= */
 
 function getStatus() {
   return {
     status: connectionStatus,
     number: connectedNumber,
-    qr: currentQR
+    qr: currentQR,
+    profileName: PROFILE_NAME
   };
 }
+
+/* =========================================
+   SEND MESSAGE
+========================================= */
 
 async function sendMessage(phone, message) {
   if (!sock || connectionStatus !== "connected") {
     throw new Error("WhatsApp is not connected.");
   }
 
-  const jid = phone.replace(/\D/g, "") + "@s.whatsapp.net";
+  if (!phone || !message) {
+    throw new Error(
+      "Phone number and message are required."
+    );
+  }
+
+  const normalizedPhone = String(phone).replace(
+    /\D/g,
+    ""
+  );
+
+  if (!normalizedPhone) {
+    throw new Error(
+      "A valid phone number is required."
+    );
+  }
+
+  const jid =
+    normalizedPhone + "@s.whatsapp.net";
 
   const result = await sock.sendMessage(jid, {
-    text: message
+    text: String(message)
   });
 
   return result;
 }
 
-async function logout() {
-  connectEpoch++; // invalidate any pending auto-restart
+/* =========================================
+   LOGOUT / DISCONNECT
+========================================= */
 
-  if (sock) {
+async function logout() {
+  connectEpoch++;
+
+  const oldSocket = sock;
+
+  sock = null;
+  connectionStatus = "disconnected";
+  currentQR = null;
+  connectedNumber = null;
+
+  if (oldSocket) {
     try {
-      // Stop the close-handler from also firing a restart.
-      sock.ev.removeAllListeners();
-      await sock.logout();
+      oldSocket.ev.removeAllListeners();
+      await oldSocket.logout();
     } catch (error) {
-      console.error("Logout error:", error.message);
+      console.error(
+        "WhatsApp logout error:",
+        error.message
+      );
     }
   }
 
   await clearSession();
 
-  // Start over immediately so the dashboard shows a fresh QR.
+  // Start a new linking attempt so the dashboard
+  // can display a fresh QR code.
   startWhatsApp().catch((error) => {
-    console.error("Failed to restart WhatsApp OTP after logout:", error);
+    console.error(
+      "Failed to restart WhatsApp after logout:",
+      error.message
+    );
   });
 }
+
+/* =========================================
+   EXPORT FUNCTIONS
+========================================= */
 
 export {
   startWhatsApp,
